@@ -11,10 +11,12 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-LINEMOD_PATH = Path('/BLENDERPROC/OUTPUT/PATH/bop_data/ycbv') # BlenderProc synthesized images
-NERF_PATH = Path('/OUTPUT/DATA/PATH/TO/TRAIN/NERF')
+# LINEMOD_PATH = Path('/BLENDERPROC/OUTPUT/PATH/bop_data/ycbv') # BlenderProc synthesized images
+LINEMOD_PATH = Path('/cluster/scratch/zhiyhuang/BOP/bop_toolkit/test_output/bop_data/ycbv') # BlenderProc synthesized images
+# NERF_PATH = Path('/OUTPUT/DATA/PATH/TO/TRAIN/NERF')
+NERF_PATH = Path('test_train_data')
 
-Num_train = 200 # number of trianing images, the rest would be test image
+Num_train = 100 # number of trianing images, the rest would be test image
 
 from shutil import copyfile
 
@@ -46,8 +48,9 @@ object_id = args.object_id
 print(object_id)
 skip_every = 1
 object_name = LINEMOD_ID_TO_NAME[f"{object_id:06d}"]
-# dataset_dir = NERF_PATH / object_name
-dataset_dir = NERF_PATH
+dataset_dir = NERF_PATH / f"{object_id:06d}"
+NERF_PATH = NERF_PATH / f"{object_id:06d}"
+# dataset_dir = NERF_PATH
 if not os.path.exists(dataset_dir):
     os.makedirs(dataset_dir)
 # create train test val image in target
@@ -125,6 +128,9 @@ for i, img_path in tqdm(enumerate(imgs)):
 train_data = {}
 train_data['near'] = float(min(train_near) - 0.05) # 0.05 represent the enlarged margin
 train_data['far'] = float(max(train_far)+ 0.05)
+# compatitable with instance nerf
+train_data['fl_x'] = camera_info['fx']
+train_data['fl_y'] = camera_info['fy']
 train_data['frames'] = train_frames
 filepath = os.path.join(dataset_dir, 'transforms_train.json')
 with open(filepath, 'w') as f:
@@ -133,6 +139,9 @@ with open(filepath, 'w') as f:
 test_data = {}
 test_data['near'] = float(min(test_near) - 0.05)
 test_data['far'] = float(max(test_far)+ 0.05)
+# compatitable with instance nerf
+test_data['fl_x'] = camera_info['fx']
+test_data['fl_y'] = camera_info['fy']
 test_data['frames'] = test_frames
 filepath = os.path.join(dataset_dir, 'transforms_test.json')
 with open(filepath, 'w') as f:

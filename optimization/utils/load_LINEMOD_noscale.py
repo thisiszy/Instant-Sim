@@ -183,7 +183,7 @@ def load_data_param(basedir, half_res=False, testskip=1):
     #     focal = focal / 2.
     #     # imgs = tf.image.resize_area(imgs, [400, 400]).numpy()
     if half_res:
-        scale_factor = 4
+        scale_factor = 1
         # change K aswell
         K[0] = [i / scale_factor for i in K[0]]
         K[1] = [i / scale_factor for i in K[1]]

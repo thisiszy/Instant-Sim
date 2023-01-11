@@ -41,34 +41,34 @@
         ]
       }
     },
-#    {
-#      "module": "lighting.LightLoader",
-#      "config": {
-#        "lights": [
-#          {
-#            "type": "POINT",
-##            "color": [0, 0, 255], # blue
-##            "color": [255, 0, 0], # red
-#            "location": [ 5, 5, 5 ],
-#            "energy": 2000
-#          }
-#        ]
-#      }
-#    },
-#    {
-#      "module": "lighting.LightLoader",
-#      "config": {
-#        "lights": [
-#          {
-#            "type": "POINT",
-##            "color": [0, 0, 255], # blue
-##            "color": [255, 0, 0], # red
-#            "location": [ -5, -5, 5 ],
-#            "energy": 2000
-#          }
-#        ]
-#      }
-#    },
+   {
+     "module": "lighting.LightLoader",
+     "config": {
+       "lights": [
+         {
+           "type": "POINT",
+#            "color": [0, 0, 255], # blue
+#            "color": [255, 0, 0], # red
+           "location": [ 5, 5, 5 ],
+           "energy": 2000
+         }
+       ]
+     }
+   },
+   {
+     "module": "lighting.LightLoader",
+     "config": {
+       "lights": [
+         {
+           "type": "POINT",
+#            "color": [0, 0, 255], # blue
+#            "color": [255, 0, 0], # red
+           "location": [ -5, -5, 5 ],
+           "energy": 2000
+         }
+       ]
+     }
+   },
 
     {
       "module": "camera.CameraSampler",
@@ -81,7 +81,7 @@
         "output_key": "pose",
         "cam_poses": [
           {
-            "number_of_samples": 300,
+            "number_of_samples": 200,
             "location": {
               "provider": "sampler.Shell",
               "center": [ 0, 0, 0 ],
