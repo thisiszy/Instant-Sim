@@ -260,148 +260,148 @@ class TrainerInstant(Trainer):
         return torch.mean(torch.stack(dLdpsis), 0) # average the gradient
 
 
-class NeRF:
-    def __init__(self, args): # create nerf
-        self.param = args
-        if not os.path.exists(os.path.join(self.param.basedir, self.param.expname)):
-            os.makedirs(os.path.join(self.param.basedir, self.param.expname))  # this is the place to save Nerf pretrained model
-        # Load data in LINEMOD format
-        self.K = None
-        self.hwf, self.K, self.near, self.far = load_data_param(self.param.datadir, self.param.half_res,
-                                                                                    self.param.testskip)
-        print(f'Loaded LINEMOD, images shape: {self.hwf[:2]}, hwf: {self.hwf}, K: {self.K}')
-        print(f'[CHECK HERE] near: {self.near}, far: {self.far}.')
+# class NeRF:
+#     def __init__(self, args): # create nerf
+#         self.param = args
+#         if not os.path.exists(os.path.join(self.param.basedir, self.param.expname)):
+#             os.makedirs(os.path.join(self.param.basedir, self.param.expname))  # this is the place to save Nerf pretrained model
+#         # Load data in LINEMOD format
+#         self.K = None
+#         self.hwf, self.K, self.near, self.far = load_data_param(self.param.datadir, self.param.half_res,
+#                                                                                     self.param.testskip)
+#         print(f'Loaded LINEMOD, images shape: {self.hwf[:2]}, hwf: {self.hwf}, K: {self.K}')
+#         print(f'[CHECK HERE] near: {self.near}, far: {self.far}.')
 
 
-        # Cast intrinsics to right types
-        H, W, focal = self.hwf
-        H, W = int(H), int(W)
-        self.hwf = [H, W, focal]
+#         # Cast intrinsics to right types
+#         H, W, focal = self.hwf
+#         H, W = int(H), int(W)
+#         self.hwf = [H, W, focal]
 
-        if self.K is None:
-            self.K = np.array([
-                [focal, 0, 0.5 * W],
-                [0, focal, 0.5 * H],
-                [0, 0, 1]
-            ])
-        # use the pretrained nerf model
-        self.param.ft_path = os.path.join(self.param.basedir, 'nerf_models', 'ycbvid{}.tar'.format(self.param.object_id))
-        self.render_kwargs_train, self.render_kwargs_test, self.start, self.grad_vars, self.optimizer = create_nerf(self.param)
+#         if self.K is None:
+#             self.K = np.array([
+#                 [focal, 0, 0.5 * W],
+#                 [0, focal, 0.5 * H],
+#                 [0, 0, 1]
+#             ])
+#         # use the pretrained nerf model
+#         self.param.ft_path = os.path.join(self.param.basedir, 'nerf_models', 'ycbvid{}.tar'.format(self.param.object_id))
+#         self.render_kwargs_train, self.render_kwargs_test, self.start, self.grad_vars, self.optimizer = create_nerf(self.param)
 
-    def render_images(self, q_psi_categorical_prob, Optimiation_parameter):
-        '''
-        Input: render parameters
-        Output: rendered images and saved path
-        '''
-        args = self.param
-        torch_softmax = torch.nn.Softmax(dim=0)
-        temperature = 0.25 # need adjust
-        categorical_prob = torch_softmax(q_psi_categorical_prob / temperature)  # still tensor
-        # sample poses with no gradient
-        categorical_prob = np.array(categorical_prob, dtype=np.float16)
-        # categorical_prob = torch.Tensor([0.4, 0.05, 0.05, 0.3, 0.05, 0.05, 0.05, 0.05]).requires_grad_() # initial pose np.array([0, 45, 90, 135, 180, 225, 270, 315]) + 22.5
-        num_K = Optimiation_parameter.n_samples_K
-        render_poses, sample_log = sample_pose_nograd(categorical_prob, num_K, Optimiation_parameter.gumble_T)
+#     def render_images(self, q_psi_categorical_prob, Optimiation_parameter):
+#         '''
+#         Input: render parameters
+#         Output: rendered images and saved path
+#         '''
+#         args = self.param
+#         torch_softmax = torch.nn.Softmax(dim=0)
+#         temperature = 0.25 # need adjust
+#         categorical_prob = torch_softmax(q_psi_categorical_prob / temperature)  # still tensor
+#         # sample poses with no gradient
+#         categorical_prob = np.array(categorical_prob, dtype=np.float16)
+#         # categorical_prob = torch.Tensor([0.4, 0.05, 0.05, 0.3, 0.05, 0.05, 0.05, 0.05]).requires_grad_() # initial pose np.array([0, 45, 90, 135, 180, 225, 270, 315]) + 22.5
+#         num_K = Optimiation_parameter.n_samples_K
+#         render_poses, sample_log = sample_pose_nograd(categorical_prob, num_K, Optimiation_parameter.gumble_T)
 
-        # Create log dir and copy the config file
-        basedir = self.param.basedir
-        expname = self.param.expname
-        os.makedirs(os.path.join(basedir, expname), exist_ok=True)
-        f = os.path.join(basedir, expname, 'args.txt')
-        with open(f, 'w') as file:
-            for arg in sorted(vars(self.param)):
-                attr = getattr(self.param, arg)
-                file.write('{} = {}\n'.format(arg, attr))
-        if self.param.config is not None:
-            f = os.path.join(basedir, expname, 'config.txt')
-            with open(f, 'w') as file:
-                file.write(open(self.param.config, 'r').read())
-
-
-
-        self.bds_dict = {
-            'near': self.near,
-            'far': self.far,
-        }
-        self.render_kwargs_train.update(self.bds_dict)
-        self.render_kwargs_test.update(self.bds_dict)
-
-        # Move testing data to GPU
-        render_poses = torch.Tensor(render_poses).to(device)
-
-        # Short circuit if only rendering out from trained model
-        print('RENDER ONLY')
-        # with torch.no_grad():
-        images = None
-        testsavedir = os.path.join(basedir, expname,
-                                   'renderonly_{}'.format('test' if args.render_test else 'path'))
-        os.makedirs(testsavedir, exist_ok=True)
-        print('test poses shape', render_poses.shape)
-
-        render_path(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, self.render_kwargs_test, gt_imgs=images,
-                              savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
-        print('Done rendering', testsavedir)
-        # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
-
-        return testsavedir, sample_log
-    def render_images_grad(self, q_psi_categorical_prob, Optimiation_parameter, sample_log, grad_E):
-        '''
-        Input: render parameters
-        Output: rendered images and saved path
-        '''
-        args = self.param
-        torch_softmax = torch.nn.Softmax(dim=0)
-        temperature = 0.25
-        categorical_prob = torch_softmax(q_psi_categorical_prob / temperature)  # still tensor
-        categorical_prob = categorical_prob.requires_grad_()
-        # sample poses
-        # categorical_prob = torch.Tensor([0.4, 0.05, 0.05, 0.3, 0.05, 0.05, 0.05, 0.05]).requires_grad_() # initial pose np.array([0, 45, 90, 135, 180, 225, 270, 315]) + 22.5
-        num_K = Optimiation_parameter.n_samples_K
-        render_poses = sample_pose(categorical_prob, num_K, Optimiation_parameter.gumble_T, sample_log)
-
-        # Create log dir and copy the config file
-        basedir = self.param.basedir
-        expname = self.param.expname
-        os.makedirs(os.path.join(basedir, expname), exist_ok=True)
-        f = os.path.join(basedir, expname, 'args.txt')
-        with open(f, 'w') as file:
-            for arg in sorted(vars(self.param)):
-                attr = getattr(self.param, arg)
-                file.write('{} = {}\n'.format(arg, attr))
-        if self.param.config is not None:
-            f = os.path.join(basedir, expname, 'config.txt')
-            with open(f, 'w') as file:
-                file.write(open(self.param.config, 'r').read())
+#         # Create log dir and copy the config file
+#         basedir = self.param.basedir
+#         expname = self.param.expname
+#         os.makedirs(os.path.join(basedir, expname), exist_ok=True)
+#         f = os.path.join(basedir, expname, 'args.txt')
+#         with open(f, 'w') as file:
+#             for arg in sorted(vars(self.param)):
+#                 attr = getattr(self.param, arg)
+#                 file.write('{} = {}\n'.format(arg, attr))
+#         if self.param.config is not None:
+#             f = os.path.join(basedir, expname, 'config.txt')
+#             with open(f, 'w') as file:
+#                 file.write(open(self.param.config, 'r').read())
 
 
 
-        self.bds_dict = {
-            'near': self.near,
-            'far': self.far,
-        }
-        self.render_kwargs_train.update(self.bds_dict)
-        self.render_kwargs_test.update(self.bds_dict)
+#         self.bds_dict = {
+#             'near': self.near,
+#             'far': self.far,
+#         }
+#         self.render_kwargs_train.update(self.bds_dict)
+#         self.render_kwargs_test.update(self.bds_dict)
 
-        # Move testing data to GPU
-        render_poses = torch.Tensor(render_poses).to(device)
-        # categorical_prob = categorical_prob.cuda()
-        # Short circuit if only rendering out from trained model
-        print('RENDER ONLY')
-        # with torch.no_grad():
-        images = None
-        testsavedir = os.path.join(basedir, expname,
-                                   'renderonly_{}'.format('test' if args.render_test else 'path'))
-        os.makedirs(testsavedir, exist_ok=True)
-        print('test poses shape', render_poses.shape)
+#         # Move testing data to GPU
+#         render_poses = torch.Tensor(render_poses).to(device)
 
-        rgbs, dLdpsis = render_path_grad(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, grad_E, self.render_kwargs_test, gt_imgs=images,
-                              savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
-        # if you want to skip rendering step
-        # rgbs = None
-        print('Done rendering', testsavedir)
-        # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+#         # Short circuit if only rendering out from trained model
+#         print('RENDER ONLY')
+#         # with torch.no_grad():
+#         images = None
+#         testsavedir = os.path.join(basedir, expname,
+#                                    'renderonly_{}'.format('test' if args.render_test else 'path'))
+#         os.makedirs(testsavedir, exist_ok=True)
+#         print('test poses shape', render_poses.shape)
 
-        return torch.mean(torch.stack(dLdpsis), 0) # average the gradient
+#         render_path(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, self.render_kwargs_test, gt_imgs=images,
+#                               savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
+#         print('Done rendering', testsavedir)
+#         # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+
+#         return testsavedir, sample_log
+#     def render_images_grad(self, q_psi_categorical_prob, Optimiation_parameter, sample_log, grad_E):
+#         '''
+#         Input: render parameters
+#         Output: rendered images and saved path
+#         '''
+#         args = self.param
+#         torch_softmax = torch.nn.Softmax(dim=0)
+#         temperature = 0.25
+#         categorical_prob = torch_softmax(q_psi_categorical_prob / temperature)  # still tensor
+#         categorical_prob = categorical_prob.requires_grad_()
+#         # sample poses
+#         # categorical_prob = torch.Tensor([0.4, 0.05, 0.05, 0.3, 0.05, 0.05, 0.05, 0.05]).requires_grad_() # initial pose np.array([0, 45, 90, 135, 180, 225, 270, 315]) + 22.5
+#         num_K = Optimiation_parameter.n_samples_K
+#         render_poses = sample_pose(categorical_prob, num_K, Optimiation_parameter.gumble_T, sample_log)
+
+#         # Create log dir and copy the config file
+#         basedir = self.param.basedir
+#         expname = self.param.expname
+#         os.makedirs(os.path.join(basedir, expname), exist_ok=True)
+#         f = os.path.join(basedir, expname, 'args.txt')
+#         with open(f, 'w') as file:
+#             for arg in sorted(vars(self.param)):
+#                 attr = getattr(self.param, arg)
+#                 file.write('{} = {}\n'.format(arg, attr))
+#         if self.param.config is not None:
+#             f = os.path.join(basedir, expname, 'config.txt')
+#             with open(f, 'w') as file:
+#                 file.write(open(self.param.config, 'r').read())
+
+
+
+#         self.bds_dict = {
+#             'near': self.near,
+#             'far': self.far,
+#         }
+#         self.render_kwargs_train.update(self.bds_dict)
+#         self.render_kwargs_test.update(self.bds_dict)
+
+#         # Move testing data to GPU
+#         render_poses = torch.Tensor(render_poses).to(device)
+#         # categorical_prob = categorical_prob.cuda()
+#         # Short circuit if only rendering out from trained model
+#         print('RENDER ONLY')
+#         # with torch.no_grad():
+#         images = None
+#         testsavedir = os.path.join(basedir, expname,
+#                                    'renderonly_{}'.format('test' if args.render_test else 'path'))
+#         os.makedirs(testsavedir, exist_ok=True)
+#         print('test poses shape', render_poses.shape)
+
+#         rgbs, dLdpsis = render_path_grad(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, grad_E, self.render_kwargs_test, gt_imgs=images,
+#                               savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
+#         # if you want to skip rendering step
+#         # rgbs = None
+#         print('Done rendering', testsavedir)
+#         # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+
+#         return torch.mean(torch.stack(dLdpsis), 0) # average the gradient
 
 
 class Writer(HookBase):
@@ -1305,17 +1305,22 @@ def main():
     # Load parameters of nerf
     parser = config_parser()
     args = parser.parse_args()
-    Nerf_parameter = args
-    # my_nerf = NeRF(Nerf_parameter) # nerf initialization
-    my_nerf = NeRFNetwork(
+    # Nerf_parameter = args
+    # my_nerf = NeRF(Nerf_parameter)
+    args.fp16 = True
+    args.cuda_ray = True # args.cuda_ray and args.fp16 evaluate false otherwise
+
+    my_nerf = NeRFNetwork( # use instant-nerf surrogate
         encoding="hashgrid",
         bound=args.bound,
         cuda_ray=args.cuda_ray,
         density_scale=1,
         min_near=args.min_near,
-        density_thresh=args.density_thresh,
+        density_thresh=args.density_thresh, # 10 or 0.01 ?
         bg_radius=args.bg_radius,
     )
+
+    print(my_nerf)
 
     criterion = torch.nn.MSELoss(reduction='none')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
