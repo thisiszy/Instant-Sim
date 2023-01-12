@@ -131,14 +131,18 @@ class TrainerInstant(Trainer):
         
         basedir = self.param.basedir
         expname = self.param.expname
-        breakpoint()
+        # breakpoint()
         with torch.no_grad():  # this is important to save memory!!!!!!!
             for i, c2w in enumerate(tqdm(render_poses)):
 
+                print(c2w.shape) # [4,4]
+                pose = c2w[:3,:4] # need to extract the pose(first 3 cols) as the input of get_rays(), according to NS
                 H, W, _ = self.hwf
-                rays_o, rays_d = get_rays(H, W, self.K, c2w)
+                
+                rays_o, rays_d = get_rays(H, W, self.K, pose) # need to check whether get_rays() in NS is compatible with IN render()
+                # the input pose is the same, but get_rays() in IN has extra output: inds, for sample_pdf (which is somehow not used in run_cuda)
 
-                outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=None, **vars(self.opt))
+                outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, **vars(self.opt))
                 image = outputs['image'].reshape(-1, H, W, 3)
 
                 testsavedir = os.path.join(basedir, expname,
@@ -203,10 +207,53 @@ class TrainerInstant(Trainer):
         os.makedirs(testsavedir, exist_ok=True)
         print('test poses shape', render_poses.shape)
 
-        rgbs, dLdpsis = render_path_grad(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, grad_E, self.render_kwargs_test, gt_imgs=images,
-                              savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
-        # if you want to skip rendering step
-        # rgbs = None
+        # rgbs, dLdpsis = render_path_grad(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, grad_E, self.render_kwargs_test, gt_imgs=images,
+        #                       savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
+
+        breakpoint()
+        images = []
+        dLdpsis = []
+
+        for i_pose, c2w in enumerate(tqdm(render_poses)):
+            if i_pose >= len(grad_E): break
+            pose = c2w[:3,:4]
+            image = [] 
+            sh = rays_d.shape
+
+            H, W, _ = self.hwf
+            rays_o, rays_d = get_rays(H, W, self.K, c2w)# use get_rays() or get_rays_np()? looks the same in NS
+
+            # coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
+            #                      -1)  # (H, W, 2)
+            # coords = torch.reshape(coords, [-1, 2])  # (H * W, 2)
+
+            grad_E_i = torch.Tensor(grad_E[i_pose]['grad_E'][0].numpy().transpose(1, 2, 0)).cuda()
+            grad_E_i = torch.reshape(grad_E_i, [-1, 3])  # (H * W, 3)
+
+            batch_rays = torch.stack([rays_o,rays_d],0) # pack rays for autograd
+            # using run_cuda() for rendering
+            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, **vars(self.opt)) # why in NS, they forces batchify rednering here? 
+            image = outputs['image']
+            # image = image.reshape(-1, H, W, 3)
+
+            dLdray = torch.autograd.grad(image, batch_rays,
+                                             grad_outputs=grad_E_i)
+            dLdpsi = torch.autograd.grad(batch_rays, categorical_prob,
+                                             grad_outputs=dLdray,
+                                             retain_graph=True)
+
+            dLdpsis = dLdpsi[0].cpu().detach() # detach means do not need tracking gradient
+            images.append(image.cpu().detach().reshape(-1, H, W, 3)) # store image(pose_i) in the images(all iter_ed poses)
+
+            if testsavedir is not None:
+                rgb8 = to8b(images[-1])
+                if not os.path.exists(os.path.join(testsavedir, str(self.param.object_id), 'withgrad')):
+                    os.makedirs(os.path.join(testsavedir, str(self.param.object_id), 'withgrad'))
+                filename = os.path.join(testsavedir, str(self.param.object_id), 'withgrad',
+                                        '{:03d}.png'.format(i_pose))  # double check
+                imageio.imwrite(filename, rgb8)
+
+
         print('Done rendering', testsavedir)
         # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
