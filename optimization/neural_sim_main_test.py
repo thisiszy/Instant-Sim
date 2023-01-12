@@ -1310,9 +1310,12 @@ def main():
     args.fp16 = True
     args.cuda_ray = True # args.cuda_ray and args.fp16 evaluate false otherwise
 
+    print(args.bound) # need to check the args.bound of init inst-nerf and pretrained one
+    args.bound = 1
+
     my_nerf = NeRFNetwork( # use instant-nerf surrogate
         encoding="hashgrid",
-        bound=args.bound,
+        bound=args.bound, # default is 2, but default 1 in pretained inst-nerf
         cuda_ray=args.cuda_ray,
         density_scale=1,
         min_near=args.min_near,
