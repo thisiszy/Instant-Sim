@@ -12,6 +12,7 @@ sys.path.insert(0, "/cluster/home/zhiyhuang/instant-nerf/torch-ngp/")
 from nerf.network import NeRFNetwork
 from nerf.provider import *
 from nerf.utils import *
+import nerf.utils as util_instant
 import numpy as np
 import imageio
 import json
@@ -82,14 +83,14 @@ class TrainerInstant(Trainer):
                  world_size=1, # total num of GPUs
                  device=None, # device to use, usually setting to None is OK. (auto choose device)
                  mute=False, # whether to mute all print
-                 fp16=False, # amp optimize level
-                 eval_interval=1, # eval once every $ epoch
+                 fp16=opt.fp16, # amp optimize level
+                 eval_interval=50, # eval once every $ epoch
                  max_keep_ckpt=2, # max num of saved ckpts in disk
-                 workspace='workspace', # workspace to save logs & ckpts
+                 workspace=opt.workspace, # workspace to save logs & ckpts
                  best_mode='min', # the smaller/larger result, the better
                  use_loss_as_metric=True, # use loss as the first metric
                  report_metric_at_train=False, # also report metrics at training
-                 use_checkpoint="latest", # which ckpt to use at init time
+                 use_checkpoint=opt.ckpt, # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
                  )
@@ -98,7 +99,7 @@ class TrainerInstant(Trainer):
             os.makedirs(os.path.join(self.param.basedir, self.param.expname))  # this is the place to save Nerf pretrained model
         # Load data in LINEMOD format
         self.K = None
-        self.hwf, self.K, self.near, self.far = load_data_param(self.param.datadir, self.param.half_res,
+        self.hwf, self.K, self.near, self.far, self.intrinsics = load_data_param(self.param.datadir, self.param.half_res,
                                                                                     self.param.testskip)
         print(f'Loaded LINEMOD, images shape: {self.hwf[:2]}, hwf: {self.hwf}, K: {self.K}')
         print(f'[CHECK HERE] near: {self.near}, far: {self.far}.')
@@ -135,13 +136,18 @@ class TrainerInstant(Trainer):
         with torch.no_grad():  # this is important to save memory!!!!!!!
             for i, c2w in enumerate(tqdm(render_poses)):
 
-                print(c2w.shape) # [4,4]
-                pose = c2w[:3,:4] # need to extract the pose(first 3 cols) as the input of get_rays(), according to NS
+                # print(c2w.shape) # [4,4]
+                # pose = c2w[:3,:4] # need to extract the pose(first 3 cols) as the input of get_rays(), according to NS
                 H, W, _ = self.hwf
                 
-                rays_o, rays_d = get_rays(H, W, self.K, pose) # need to check whether get_rays() in NS is compatible with IN render()
+                # rays_o, rays_d = get_rays(H, W, self.K, c2w=c2w) # need to check whether get_rays() in NS is compatible with IN render()
+                results = util_instant.get_rays(c2w.reshape(1, 4, 4), self.intrinsics, H, W, -1)
+                rays_o = results['rays_o']
+                rays_d = -results['rays_d']
+                # breakpoint()
                 # the input pose is the same, but get_rays() in IN has extra output: inds, for sample_pdf (which is somehow not used in run_cuda)
-
+                # rays_o = rays_o.reshape(1, -1, 3)
+                # rays_d = rays_d.reshape(1, -1, 3)
                 outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, **vars(self.opt))
                 image = outputs['image'].reshape(-1, H, W, 3)
 
@@ -188,12 +194,12 @@ class TrainerInstant(Trainer):
 
 
 
-        self.bds_dict = {
-            'near': self.near,
-            'far': self.far,
-        }
-        self.render_kwargs_train.update(self.bds_dict)
-        self.render_kwargs_test.update(self.bds_dict)
+        # self.bds_dict = {
+        #     'near': self.near,
+        #     'far': self.far,
+        # }
+        # self.render_kwargs_train.update(self.bds_dict)
+        # self.render_kwargs_test.update(self.bds_dict)
 
         # Move testing data to GPU
         render_poses = torch.Tensor(render_poses).to(device)
@@ -210,40 +216,87 @@ class TrainerInstant(Trainer):
         # rgbs, dLdpsis = render_path_grad(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, grad_E, self.render_kwargs_test, gt_imgs=images,
         #                       savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
 
-        breakpoint()
+        
         images = []
         dLdpsis = []
+        chunk = 4096
+        self.model.train()
 
         for i_pose, c2w in enumerate(tqdm(render_poses)):
             if i_pose >= len(grad_E): break
-            pose = c2w[:3,:4]
+            # pose = c2w[:3,:4]
             image = [] 
-            sh = rays_d.shape
 
             H, W, _ = self.hwf
-            rays_o, rays_d = get_rays(H, W, self.K, c2w)# use get_rays() or get_rays_np()? looks the same in NS
+            coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
+                                 -1)  # (H, W, 2)
+            coords = torch.reshape(coords, [-1, 2])
+            
+            results = util_instant.get_rays(c2w.reshape(1, 4, 4), self.intrinsics, H, W, -1)
+            rays_o = results['rays_o']
+            rays_d = -results['rays_d']
 
-            # coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
-            #                      -1)  # (H, W, 2)
-            # coords = torch.reshape(coords, [-1, 2])  # (H * W, 2)
+            rays_o = rays_o.reshape(H, W, 3)
+            rays_d = rays_d.reshape(H, W, 3)
 
             grad_E_i = torch.Tensor(grad_E[i_pose]['grad_E'][0].numpy().transpose(1, 2, 0)).cuda()
             grad_E_i = torch.reshape(grad_E_i, [-1, 3])  # (H * W, 3)
 
-            batch_rays = torch.stack([rays_o,rays_d],0) # pack rays for autograd
-            # using run_cuda() for rendering
-            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, **vars(self.opt)) # why in NS, they forces batchify rednering here? 
-            image = outputs['image']
-            # image = image.reshape(-1, H, W, 3)
 
-            dLdray = torch.autograd.grad(image, batch_rays,
-                                             grad_outputs=grad_E_i)
-            dLdpsi = torch.autograd.grad(batch_rays, categorical_prob,
+
+            for i in range(0, coords.shape[0], chunk):
+                select_coords = coords[i:i + chunk].long()
+                rays_o_i = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                rays_d_i = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                # rays_o_i = rays_o_i.reshape(1, -1, 3)
+                # rays_d_i = rays_d_i.reshape(1, -1, 3)
+                batch_rays = torch.stack([rays_o_i, rays_d_i], 0)
+
+                # core rendering step
+                prev = self.model.cuda_ray
+                self.model.cuda_ray = False
+                # with torch.no_grad():
+                outputs = self.model.render(batch_rays[0].reshape(1, -1, 3), batch_rays[1].reshape(1, -1, 3), staged=True, bg_color=None, perturb = True, **vars(self.opt)) # why in NS, they forces batchify rednering here? 
+                self.model.cuda_ray = prev
+
+                image_p = outputs['image']
+                patch_grad_E = grad_E_i[i:i + chunk]
+                image_p = image_p.reshape(-1, 3)
+                dLdray = torch.autograd.grad(image_p, batch_rays,
+                                             grad_outputs=patch_grad_E)
+                # dLdray_o = torch.autograd.grad(image_p, rays_o_i, grad_outputs=patch_grad_E, retain_graph=True)
+                # dLdray_d = torch.autograd.grad(image_p, rays_d_i, grad_outputs=patch_grad_E, retain_graph=True)
+                # dLdpsi_o = torch.autograd.grad(rays_o_i, categorical_prob, grad_outputs=dLdray_o, retain_graph=True)
+                # dLdpsi_d = torch.autograd.grad(rays_d_i, categorical_prob, grad_outputs=dLdray_d, retain_graph=True)
+                # dLdpsi = torch.autograd.grad(batch_rays, categorical_prob,
+                #                              grad_outputs=(torch.stack([dLdray_o[0], dLdray_d[0]], 0)),
+                #                              retain_graph=True)
+                dLdpsi = torch.autograd.grad(batch_rays, categorical_prob,
                                              grad_outputs=dLdray,
                                              retain_graph=True)
 
-            dLdpsis = dLdpsi[0].cpu().detach() # detach means do not need tracking gradient
-            images.append(image.cpu().detach().reshape(-1, H, W, 3)) # store image(pose_i) in the images(all iter_ed poses)
+                dLdpsis.append(dLdpsi[0].cpu().detach())  # detach means do not need tracking gradient
+                image.append(image_p.cpu().detach())
+
+                torch.cuda.empty_cache()
+
+            
+            simge_image = torch.reshape(torch.cat(image, 0), list((H, W, 3)))
+            images.append(simge_image.cpu().detach().numpy())
+
+            # self.model.train()
+            
+            # image = outputs['image']
+            # image = image.reshape(-1, H, W, 3)
+
+            # dLdray = torch.autograd.grad(image, batch_rays.reshape(2, -1, 3),
+            #                                  grad_outputs=grad_E_i)
+            # dLdpsi = torch.autograd.grad(batch_rays, categorical_prob,
+            #                                  grad_outputs=dLdray,
+            #                                  retain_graph=True)
+
+            # dLdpsis = dLdpsi[0].cpu().detach() # detach means do not need tracking gradient
+            # images.append(image.cpu().detach().reshape(-1, H, W, 3)) # store image(pose_i) in the images(all iter_ed poses)
 
             if testsavedir is not None:
                 rgb8 = to8b(images[-1])
@@ -256,6 +309,7 @@ class TrainerInstant(Trainer):
 
         print('Done rendering', testsavedir)
         # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+        self.model.eval()
 
         return torch.mean(torch.stack(dLdpsis), 0) # average the gradient
 
@@ -605,7 +659,7 @@ class Detector:
                         os.makedirs(os.path.join(output_dir, s, class_name))
                     copyfile(file_path, target_file_path)
                     # load image and compute annotation
-                    bboxs, mask, height, width = self.get_annotation(file_path)
+                    bboxs, mask, height, width, _ = self.get_annotation(file_path)
                     new_img = {}
                     new_img["license"] = 0
                     new_img["file_name"] = os.path.join(s, class_name, f)  # relative path
@@ -722,7 +776,8 @@ class Detector:
         height, width = gray_img.shape
         (_, mask) = cv2.threshold(gray_img, 1, 255, cv2.THRESH_BINARY)  # get mask
         bboxs = self.find_bbox(mask)[:, :-1]
-        return bboxs, mask, height, width
+        cv2.rectangle(img,(bboxs[0][0], bboxs[0][1]),(bboxs[0][0]+bboxs[0][2],bboxs[0][1]+bboxs[0][3]),(0,255,0),2)
+        return bboxs, mask, height, width, img
 
     def get_ycbv_dicts(self, ycbv_basedir):
 
@@ -737,7 +792,9 @@ class Detector:
                     record = {}
 
                     filename = os.path.join(ycbv_basedir, cate, img)
-                    bboxs, mask, height, width = self.get_annotation(filename)
+                    bboxs, mask, height, width, visual_img = self.get_annotation(filename)
+                    cv2.imwrite(os.path.join(ycbv_basedir, cate, "bbox", img), visual_img)
+                    print(os.path.join(ycbv_basedir, cate, "bbox", img))
                     if bboxs.shape[0] > 1:  # if have multiple objects, choose the largest one
                         bboxs = [bboxs[np.argmax(bboxs[:, -2] * bboxs[:, -1], axis=0)]]
                     record["file_name"] = filename
@@ -1120,6 +1177,7 @@ def bilevel_optimization(my_nerf, my_detector, Optimiation_parameter):
             inverse_hvp = my_detector.compute_inverse_hvp() # inverse_hvp = H^-1 * dL_val/dtheta fix backbone only update last layers (accurate)
             print('##########################################AFTER  inverse_hvp  ##################################################')
             # 3.2 Computer gradient of expectations (first part d (dL_train/dtheta) / d I)
+            breakpoint()
             grad_E = my_detector.compute_grad_E(inverse_hvp) # d (dL_train/dtheta) / d I * inverse_hvp (weight)
             print('##########################################AFTER  grad_E  ##################################################')
             # 3.3 Compute dI/d\psi in image patch wise, Run forward of NeRF again for backward.
@@ -1186,8 +1244,8 @@ def config_parser():
                         help='number of coarse samples per ray')
     parser.add_argument("--N_importance", type=int, default=0,
                         help='number of additional fine samples per ray')
-    parser.add_argument("--perturb", type=float, default=1.,
-                        help='set to 0. for no jitter, 1. for jitter')
+    # parser.add_argument("--perturb", type=float, default=1.,
+    #                     help='set to 0. for no jitter, 1. for jitter')
     parser.add_argument("--use_viewdirs", action='store_true',
                         help='use full 5D input instead of 3D')
     parser.add_argument("--i_embed", type=int, default=0,
@@ -1307,11 +1365,9 @@ def main():
     args = parser.parse_args()
     # Nerf_parameter = args
     # my_nerf = NeRF(Nerf_parameter)
-    args.fp16 = True
     args.cuda_ray = True # args.cuda_ray and args.fp16 evaluate false otherwise
 
     print(args.bound) # need to check the args.bound of init inst-nerf and pretrained one
-    args.bound = 1
 
     my_nerf = NeRFNetwork( # use instant-nerf surrogate
         encoding="hashgrid",
@@ -1322,6 +1378,7 @@ def main():
         density_thresh=args.density_thresh, # 10 or 0.01 ?
         bg_radius=args.bg_radius,
     )
+    my_nerf.eval()
 
     print(my_nerf)
 
