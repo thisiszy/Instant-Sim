@@ -39,9 +39,9 @@ Download our blender [scene file and hand model](https://drive.google.com/file/d
 Use COS to generate 100 train and test pictures.
 
 ### 2. Train your own nerf
-Download our [hand dataset](https://drive.google.com/file/d/1FSAwQpheviDZlX_RjlX8XA9HmPfwNW5E/view?usp=share_link) and extract to `data/` folder.
+Download our [hand dataset](https://drive.google.com/file/d/1FSAwQpheviDZlX_RjlX8XA9HmPfwNW5E/view?usp=share_link) and extract to `data` folder.
 
-Train three one by one:
+Train three hand gestures one by one:
 ```bash
 cd optimization
 python train_nerf.py ../data/hand_palm
