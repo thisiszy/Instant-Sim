@@ -1,130 +1,59 @@
-# Neural-Sim: Learning to Generate Training Data with NeRF
+# Course project for Deep learning (263-3210-00L, 2022FS, ETH)
+Data Augmentation with Instant-NeRF
 
-[ECCV 2022] [Neural-Sim: Learning to Generate Training Data with NeRF](https://arxiv.org/pdf/2207.11368.pdf)
-
-Code are actively updating, thanks!
+This repo is still in actively updating!
 
 ## Overview
-The code is for On-demand synthetic data generation: Given a target task and a
-test dataset, our approach “Neural-sim” generates data on-demand using a fully
-differentiable synthetic data generation pipeline which maximises accuracy for
-the target task.
-<div align="center">
-    <img src="./docs/neural-sim.png" alt="Editor" width="500">
-</div>
-
-
-Neural-Sim pipeline: Our pipeline finds the optimal parameters for generating views from a trained neural renderer (NeRF) to use as training data for
-object detection. The objective is to find the optimal NeRF rendering parameters ψ that can generate synthetic training data Dtrain, such that the model
-(RetinaNet, in our experiments) trained on Dtrain, maximizes accuracy on a
-downstream task represented by the validation set Dval
+This is the source code for this course project. Generally speaking, we integrate [Instant-NeRF](https://github.com/NVlabs/instant-ngp) (followed this pytorch [implementaion](https://github.com/ashawkey/torch-ngp)) in the original version of [Neural-Sim](https://github.com/gyhandy/Neural-Sim-NeRF) to facilitate NeRF model training and evaluation step for downstream task. We ran the experiments on a self-generated dataset: hand gesture detection based on BlenderNeRF, to verify the successful integration. 
 
 <div align="center">
-    <img src="./docs/pipeline.png" alt="Editor" width="800">
+    <img src="./overview1.png" width="800">
 </div>
 
-## 1 Installation
+<br/>
 
-Start by cloning the repo:
+Note: This project is intended for gaining fundamental knowledge and practical implementaion of NeRFs. Due to the customized implementation of (Instant-) NeRFs, merging two repo is not trivial and a thorough understanding of source code is required. Hence, we want to clarify here that, some modifications are hardcoded and we do not guarantee all terminal flag options work properly as they used to be. But feel free to post any regarding issues! We also post out the code illustration here to help you understanding the pipeline.      
 
-```bash
-git clone https://github.com/gyhandy/Neural-Sim-NeRF.git
-```
+<br /><br />
 
 
-1 install the requirement of nerf-pytorch
-```bash
-pip install -r requirements.txt
-```
+### Implementation Detials 
+<div align="center">
+    <img src="./torch_ngp_.png" width="800">
+</div>
 
-2 install [detectorn2](https://detectron2.readthedocs.io/en/latest/tutorials/install.html)
+<br />
+Above is the workflow of Instant-NeRF, we mark used files/classes in blue and modified ones in green, which are intended for code integration. Grey boxes are irrelavant to this project or we rewrite with other file to support similar functionalities. 
 
-## 2 NeRF models and dataset
+<br /><br />
 
+<div align="center">
+    <img src="./inst-sim_.png" width="800">
+</div>
 
-### Quick start
+<br />
+This is the structure of modified main function of Neural-Sim, which support Instant NeRF's evaluation (<code>render_images()</code>) and with-grad inference (<code>render_images_grad()</code>). These are two critical functions that in charge of rendering images for downstream task, which requires NeRF integration. Some encountered issues during our implementation are listed as followings:
 
+- Both functions starts with sampling from given distributions via intact categorical sampling function from Neural-Sim. Ensuing is configuring render parameteres, which should be modified to be compatible with <code>get_rays()</code> from Instant-NeRF. We extend the <code>render_path()</code> here, which contains rendering computation. Then renderer from TrainerInstant is called for images rendering without batching the rays to maximize the RAM usage. <code>run_cuda()</code> is called here for accelerated rendering.
+ 
+- With gradient inference for Instant-NeRF is bit more envolved with regard to our reference implementation. In details, we need to guarantee the differentiability of the rendering process with respect to the input rays( <code>ray_o && ray_d</code>).Simply turning on <code> self.training</code> (Renderer here is inherited from <code> nn.Module</code>) is not sufficient. We cannot deploy <code> cuda_ray</code> here anymore, due to that some of cuda backend fucntions pertaining to rendering computation don't have customized backward propagation function for pytorch calling. ((<code>_near_far_from_aabb, _march_rays_train</code>) in particular) You might wonder how the training of NeRF is done with cuda-ray deployed (which is our NeRF training settings) and this is because query gradient of NeRF with respent to ray batch is not what actually done in NeRF training. Updating of NeRF parameters is done by query gradient of NeRF with respent to voxels, which is responsible for the differentiability of raymarching computation. Overall, the main caveat here is we don't have a customized backward-able <code> _march_rays_train</code>, which is obatining the marching points inside the volume. This request is redundant for NeRF's training, but essential for obtaining the autograd of NeRF w.r.t to rays and then from rays to poses.<br>
+Our solution to above issue is using no-cuda rendering computation for with-grad inference of Instant-NeRF. After analysis of <code>run()</code> in <code> renderer.py</code> and the rendering computation step, we observed that,even though <code>run</code> still calls not backward-able cuda fucntion <code>-near_far_from_aabb()</code>, this computation does not cut off the computation graph of NeRF to rays. Techniquely, it calculates the marching range(near,far) of rays and split this graph into two seperate lobe. Thus, we can simply use <code> torch.no_grad()</code> to detach this computation. By doing this, we need to clarify that using cuda_ray renderer for training NeRF and no_cuda renderer for NeRF evaluation is permitted. To our knowledge, the computation of raymarching is an unbiased rendering algorithm (omitting the bias of MC-NUmerical Integration for expotential transmittance computation at high marching resolution), two different implementations for this algorithm should both converge to one image with a fixed scene (a fixed NeRF), given the same rendering arguments. It turns out that we can get visually identical rendering results with above operation, which validates our guess.
 
-For quick start, you could download our pretrained NeRF models and created sample dataset with BlenderProc
-[here](http://ilab.usc.edu/andy/dataset/ycb_syn_data_and_nerfmodel.zip). Then unzip it and place in `.logs`. 
-(Note: if not download automatically, please right click, copy the link and open in a new tab.)
+<br /><br />
 
+### Configuartion details
 
-### Train your own NeRF model with BlenderProc
+- Instant NeRF is pretrained and loaded into Neural-Sim's pipeline with saved checkpoint file. Since we need to first initialize the Instant NeRF network and call <code> load_ckeckpoint()</code> on <code> .pth</code> files to reload Instant-NeRF model in Neural-Sim. Model reload could be impaired by wrong configuration for Instant NeRF network initialization, becuase parameters of encoding layer might depend on these arguments. So,we need to guarantee the NeRF training arguments consistent with those for Neural-sim configurations (e.g bound and scale).
 
-
-#### (1) Generate Bop format images with BlenderProc 
-
-- Follow the Installation instruction of [BlenderProc](https://github.com/DLR-RM/BlenderProc)
-
-- Download [BOP dataset](https://bop.felk.cvut.cz/datasets/) object toolkit used in BlenderProc. 
-For instance, to download the YCB-V dataset toolkit, please download the "Base archive" and "Object models", two zip files.
-Then unzip ycbv_base.zip get the ycbv folder, unzip ycbv_models.zip get the models folder, move the models folder into ycbv folder.
-The path may look like this:
-```bash
--BOP
---bop_toolkit
---ycbv_models
---ycbv
----models
-```
-
-- Follow the examples (https://github.com/DLR-RM/BlenderProc/blob/main/README.md#examples) to understand the basic configuration file.
-or use our example configure files in ./data/BlenderProc/camera_sampling.
-
-Note: It would be better to create a new virtual environment for Blenderproc synthesis.
-
-example command
-```bash
-python run.py examples/camera_sampling/config.yaml /PATH/OF/BOP/ ycbv /PATH/OF/BOP/bop_toolkit/ OUTPUT/PATH
-```
-
-
-#### (2) Process synthesized images to be admitted by nerf (OPENCV --> OPENGL)
-
-if use BlenderProc synthesized image, please use
-```bash
-python data_generation-Blender.py
-```
-
-if use LatentFusion read BOP format data, please use
-```bash
-python data_generation-LINEMOD.py
-```
-
-
-#### (3) You could train NeRF with instructions [NeRF-pytorch](https://github.com/yenchenlin/nerf-pytorch)
-
-## 3 Neural_Sim Bilelve optimization pipeline
-
-```bash
-cd ./optimization
-```
-
-Please use the neural-sim_main.py to run the end-to-end pipeline. E.g.,
-
-```bash
-python neural_sim_main.py --config ../configs/nerf_param_ycbv_general.txt --object_id 2 --expname exp_ycb_synthetic --psi_pose_cats_mode 5 --test_distribution 'one_1'
-```
-'--config' indicates the NeRF parameter
-
-'--object_id' indicates the optimized ycbv object id, here is cheese box
-
-'--expname' indicates the name of experiment
-
-'--psi_pose_cats_mode' indicates the bin number of starting pose distribution during training
-
-'--test_distribution' indicates the bin number of test pose distribution
+- Another possible configuration conflict could happen in camera pose sampling step. We need to modify <code>load_LINMOD_noscale.py</code> for loading camera intrinscs from training/testing data <code>.json</code> files to <code>render_image()</code>. Besides, camera poses (camera_to_world [4 * 4] matrix) sampled from <code>sample_poses()</code> are not compatible with our settings. The default radius should be changed to the BlenderNeRF generator parameters (this cannot be done with parser, so we hardcode this). The rotation part of the sampled poses is also not compatible to our dataset, becaese we observed that the inital camera pose of Neural-Sim is different from our generation setting. By tedious experiments, we rectified this error by reverse the directions of all rays.
 
 
 
-## Contact / Cite
-If you use (part of) our code or find our work helpful, please consider citing
-```
-@article{ge2022neural,
-  title={Neural-Sim: Learning to Generate Training Data with NeRF},
-  author={Ge, Yunhao and Behl, Harkirat and Xu, Jiashu and Gunasekar, Suriya and Joshi, Neel and Song, Yale and Wang, Xin and Itti, Laurent and Vineet, Vibhav},
-  journal={arXiv preprint arXiv:2207.11368},
-  year={2022}
-}
-```
+<br /><br />
+## Reproducing experiments
+
+### (1) Dependences
+
+### (2) Training Instant-NeRF 
+
+### (3) Runing Neural-Sim task
