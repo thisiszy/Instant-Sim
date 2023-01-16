@@ -8,6 +8,11 @@ For number of iterations do:
 '''
 import os, sys
 sys.path.append("..")
+sys.path.insert(0, "../instant-nerf")
+from nerf.network import NeRFNetwork
+from nerf.provider import *
+from nerf.utils import *
+import nerf.utils as util_instant
 import numpy as np
 import imageio
 import json
@@ -39,14 +44,62 @@ from detectron2.evaluation import COCOEvaluator, inference_on_dataset
 from detectron2.utils.events import TensorboardXWriter, EventStorage
 from utils import dataset_mapper
 from optimization.utils.defaults import *
-class NeRF:
-    def __init__(self, args): # create nerf
-        self.param = args
+
+class TrainerInstant(Trainer):
+    def __init__(self, 
+                 name, # name of this experiment
+                 opt, # extra conf
+                 model, # network 
+                 criterion=None, # loss function, if None, assume inline implementation in train_step
+                 optimizer=None, # optimizer
+                 ema_decay=None, # if use EMA, set the decay
+                 lr_scheduler=None, # scheduler
+                 metrics=[], # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
+                 local_rank=0, # which GPU am I
+                 world_size=1, # total num of GPUs
+                 device=None, # device to use, usually setting to None is OK. (auto choose device)
+                 mute=False, # whether to mute all print
+                 fp16=False, # amp optimize level
+                 eval_interval=1, # eval once every $ epoch
+                 max_keep_ckpt=2, # max num of saved ckpts in disk
+                 workspace='workspace', # workspace to save logs & ckpts
+                 best_mode='min', # the smaller/larger result, the better
+                 use_loss_as_metric=True, # use loss as the first metric
+                 report_metric_at_train=False, # also report metrics at training
+                 use_checkpoint="latest", # which ckpt to use at init time
+                 use_tensorboardX=True, # whether to use tensorboard for logging
+                 scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                 ):
+        super().__init__(
+                 name, # name of this experiment
+                 opt, # extra conf
+                 model, # network 
+                 criterion=None, # loss function, if None, assume inline implementation in train_step
+                 optimizer=None, # optimizer
+                 ema_decay=None, # if use EMA, set the decay
+                 lr_scheduler=None, # scheduler
+                 metrics=[], # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
+                 local_rank=0, # which GPU am I
+                 world_size=1, # total num of GPUs
+                 device=None, # device to use, usually setting to None is OK. (auto choose device)
+                 mute=False, # whether to mute all print
+                 fp16=opt.fp16, # amp optimize level
+                 eval_interval=50, # eval once every $ epoch
+                 max_keep_ckpt=2, # max num of saved ckpts in disk
+                 workspace=opt.workspace, # workspace to save logs & ckpts
+                 best_mode='min', # the smaller/larger result, the better
+                 use_loss_as_metric=True, # use loss as the first metric
+                 report_metric_at_train=False, # also report metrics at training
+                 use_checkpoint=opt.ckpt, # which ckpt to use at init time
+                 use_tensorboardX=True, # whether to use tensorboard for logging
+                 scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                 )
+        self.param = opt
         if not os.path.exists(os.path.join(self.param.basedir, self.param.expname)):
             os.makedirs(os.path.join(self.param.basedir, self.param.expname))  # this is the place to save Nerf pretrained model
         # Load data in LINEMOD format
         self.K = None
-        self.hwf, self.K, self.near, self.far = load_data_param(self.param.datadir, self.param.half_res,
+        self.hwf, self.K, self.near, self.far, self.intrinsics = load_data_param(self.param.datadir, self.param.half_res,
                                                                                     self.param.testskip)
         print(f'Loaded LINEMOD, images shape: {self.hwf[:2]}, hwf: {self.hwf}, K: {self.K}')
         print(f'[CHECK HERE] near: {self.near}, far: {self.far}.')
@@ -58,23 +111,7 @@ class NeRF:
         self.hwf = [H, W, focal]
 
         if self.K is None:
-            self.K = np.array([
-                [focal, 0, 0.5 * W],
-                [0, focal, 0.5 * H],
-                [0, 0, 1]
-            ])
-        # use the pretrained nerf model
-        self.param.ft_path = os.path.join(self.param.basedir, 'nerf_models', 'ycbvid{}.tar'.format(self.param.object_id))
-        self.render_kwargs_train, self.render_kwargs_test, self.start, self.grad_vars, self.optimizer = create_nerf(self.param)
-
-
-    def farward_hook(module, inp, outp):
-        fmap_block['input'] = inp
-        fmap_block['output'] = outp
-
-    def backward_hook(module, grad_in, grad_out):
-        grad_block['grad_in'] = grad_in
-        grad_block['grad_out'] = grad_out
+            exit(0)
 
     def render_images(self, q_psi_categorical_prob, Optimiation_parameter):
         '''
@@ -90,48 +127,45 @@ class NeRF:
         # categorical_prob = torch.Tensor([0.4, 0.05, 0.05, 0.3, 0.05, 0.05, 0.05, 0.05]).requires_grad_() # initial pose np.array([0, 45, 90, 135, 180, 225, 270, 315]) + 22.5
         num_K = Optimiation_parameter.n_samples_K
         render_poses, sample_log = sample_pose_nograd(categorical_prob, num_K, Optimiation_parameter.gumble_T)
+        render_poses = torch.Tensor(render_poses).to(self.device)
 
-        # Create log dir and copy the config file
+        
         basedir = self.param.basedir
         expname = self.param.expname
-        os.makedirs(os.path.join(basedir, expname), exist_ok=True)
-        f = os.path.join(basedir, expname, 'args.txt')
-        with open(f, 'w') as file:
-            for arg in sorted(vars(self.param)):
-                attr = getattr(self.param, arg)
-                file.write('{} = {}\n'.format(arg, attr))
-        if self.param.config is not None:
-            f = os.path.join(basedir, expname, 'config.txt')
-            with open(f, 'w') as file:
-                file.write(open(self.param.config, 'r').read())
+        # breakpoint()
+        with torch.no_grad():  # this is important to save memory!!!!!!!
+            for i, c2w in enumerate(tqdm(render_poses)):
 
+                # print(c2w.shape) # [4,4]
+                # pose = c2w[:3,:4] # need to extract the pose(first 3 cols) as the input of get_rays(), according to NS
+                H, W, _ = self.hwf
+                
+                # rays_o, rays_d = get_rays(H, W, self.K, c2w=c2w) # need to check whether get_rays() in NS is compatible with IN render()
+                results = util_instant.get_rays(c2w.reshape(1, 4, 4), self.intrinsics, H, W, -1)
+                rays_o = results['rays_o']
+                rays_d = -results['rays_d']
+                # breakpoint()
+                # the input pose is the same, but get_rays() in IN has extra output: inds, for sample_pdf (which is somehow not used in run_cuda)
+                # rays_o = rays_o.reshape(1, -1, 3)
+                # rays_d = rays_d.reshape(1, -1, 3)
+                outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, **vars(self.opt))
+                image = outputs['image'].reshape(-1, H, W, 3)
 
-
-        self.bds_dict = {
-            'near': self.near,
-            'far': self.far,
-        }
-        self.render_kwargs_train.update(self.bds_dict)
-        self.render_kwargs_test.update(self.bds_dict)
-
-        # Move testing data to GPU
-        render_poses = torch.Tensor(render_poses).to(device)
-
-        # Short circuit if only rendering out from trained model
-        print('RENDER ONLY')
-        # with torch.no_grad():
-        images = None
-        testsavedir = os.path.join(basedir, expname,
+                testsavedir = os.path.join(basedir, expname,
                                    'renderonly_{}'.format('test' if args.render_test else 'path'))
-        os.makedirs(testsavedir, exist_ok=True)
-        print('test poses shape', render_poses.shape)
-
-        render_path(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, self.render_kwargs_test, gt_imgs=images,
-                              savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
+                
+                pred = image[0].detach().cpu().numpy()
+                pred = (pred * 255).astype(np.uint8)
+                
+                foldername = os.path.join(testsavedir, str(self.param.object_id))
+                filename = os.path.join(foldername, '{:03d}.png'.format(i)) 
+                if not os.path.exists(foldername):
+                    os.makedirs(foldername)
+                cv2.imwrite(filename , cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
         print('Done rendering', testsavedir)
-        # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
         return testsavedir, sample_log
+
     def render_images_grad(self, q_psi_categorical_prob, Optimiation_parameter, sample_log, grad_E):
         '''
         Input: render parameters
@@ -163,12 +197,12 @@ class NeRF:
 
 
 
-        self.bds_dict = {
-            'near': self.near,
-            'far': self.far,
-        }
-        self.render_kwargs_train.update(self.bds_dict)
-        self.render_kwargs_test.update(self.bds_dict)
+        # self.bds_dict = {
+        #     'near': self.near,
+        #     'far': self.far,
+        # }
+        # self.render_kwargs_train.update(self.bds_dict)
+        # self.render_kwargs_test.update(self.bds_dict)
 
         # Move testing data to GPU
         render_poses = torch.Tensor(render_poses).to(device)
@@ -182,301 +216,86 @@ class NeRF:
         os.makedirs(testsavedir, exist_ok=True)
         print('test poses shape', render_poses.shape)
 
-        rgbs, dLdpsis = render_path_grad(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, grad_E, self.render_kwargs_test, gt_imgs=images,
-                              savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
-        # if you want to skip rendering step
-        # rgbs = None
+        # rgbs, dLdpsis = render_path_grad(categorical_prob, render_poses, self.hwf, self.K, self.param.chunk, grad_E, self.render_kwargs_test, gt_imgs=images,
+        #                       savedir=testsavedir, object_id=self.param.object_id, render_factor=args.render_factor)
+
+        
+        images = []
+        dLdpsis = []
+        chunk = 4096
+        self.model.train()
+
+        for i_pose, c2w in enumerate(tqdm(render_poses)):
+            if i_pose >= len(grad_E): break
+            # pose = c2w[:3,:4]
+            image = [] 
+
+            H, W, _ = self.hwf
+            coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
+                                 -1)  # (H, W, 2)
+            coords = torch.reshape(coords, [-1, 2])
+            
+            results = util_instant.get_rays(c2w.reshape(1, 4, 4), self.intrinsics, H, W, -1)
+            rays_o = results['rays_o']
+            rays_d = -results['rays_d']
+
+            rays_o = rays_o.reshape(H, W, 3)
+            rays_d = rays_d.reshape(H, W, 3)
+
+            grad_E_i = torch.Tensor(grad_E[i_pose]['grad_E'][0].numpy().transpose(1, 2, 0)).cuda()
+            grad_E_i = torch.reshape(grad_E_i, [-1, 3])  # (H * W, 3)
+
+
+
+            for i in range(0, coords.shape[0], chunk):
+                select_coords = coords[i:i + chunk].long()
+                rays_o_i = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                rays_d_i = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                # rays_o_i = rays_o_i.reshape(1, -1, 3)
+                # rays_d_i = rays_d_i.reshape(1, -1, 3)
+                batch_rays = torch.stack([rays_o_i, rays_d_i], 0)
+
+                # core rendering step
+                prev = self.model.cuda_ray
+                self.model.cuda_ray = False
+                # with torch.no_grad():
+                outputs = self.model.render(batch_rays[0].reshape(1, -1, 3), batch_rays[1].reshape(1, -1, 3), staged=True, bg_color=None, perturb = True, **vars(self.opt)) # why in NS, they forces batchify rednering here? 
+                self.model.cuda_ray = prev
+
+                image_p = outputs['image']
+                patch_grad_E = grad_E_i[i:i + chunk]
+                image_p = image_p.reshape(-1, 3)
+                dLdray = torch.autograd.grad(image_p, batch_rays,
+                                             grad_outputs=patch_grad_E)
+                dLdpsi = torch.autograd.grad(batch_rays, categorical_prob,
+                                             grad_outputs=dLdray,
+                                             retain_graph=True)
+
+                dLdpsis.append(dLdpsi[0].cpu().detach())  # detach means do not need tracking gradient
+                image.append(image_p.cpu().detach())
+
+                torch.cuda.empty_cache()
+
+            
+            simge_image = torch.reshape(torch.cat(image, 0), list((H, W, 3)))
+            images.append(simge_image.cpu().detach().numpy())
+
+            if testsavedir is not None:
+                rgb8 = to8b(images[-1])
+                if not os.path.exists(os.path.join(testsavedir, str(self.param.object_id), 'withgrad')):
+                    os.makedirs(os.path.join(testsavedir, str(self.param.object_id), 'withgrad'))
+                filename = os.path.join(testsavedir, str(self.param.object_id), 'withgrad',
+                                        '{:03d}.png'.format(i_pose))  # double check
+                imageio.imwrite(filename, rgb8)
+
+
         print('Done rendering', testsavedir)
         # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+        self.model.eval()
 
         return torch.mean(torch.stack(dLdpsis), 0) # average the gradient
 
-    def train(self):
-        args = self.param
 
-        # Load data
-        K = None
-        if args.dataset_type == 'LINEMOD':
-            images, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(args.datadir, args.half_res,
-                                                                                        args.testskip)
-            print(f'Loaded LINEMOD, images shape: {images.shape}, hwf: {hwf}, K: {K}')
-            print(f'[CHECK HERE] near: {near}, far: {far}.')
-            i_train, i_val, i_test = i_split
-
-            if args.white_bkgd:
-                images = images[..., :3] * images[..., -1:] + (1. - images[..., -1:])
-            else:
-                images = images[..., :3]
-
-        else:
-            print('Unknown dataset type', args.dataset_type, 'exiting')
-            return
-
-        # Cast intrinsics to right types
-        H, W, focal = hwf
-        H, W = int(H), int(W)
-        hwf = [H, W, focal]
-
-        if K is None:
-            K = np.array([
-                [focal, 0, 0.5 * W],
-                [0, focal, 0.5 * H],
-                [0, 0, 1]
-            ])
-
-        if args.render_test:
-            render_poses = np.array(poses[i_test])
-
-        # Create log dir and copy the config file
-        basedir = args.basedir
-        expname = args.expname
-        os.makedirs(os.path.join(basedir, expname), exist_ok=True)
-        f = os.path.join(basedir, expname, 'args.txt')
-        with open(f, 'w') as file:
-            for arg in sorted(vars(args)):
-                attr = getattr(args, arg)
-                file.write('{} = {}\n'.format(arg, attr))
-        if args.config is not None:
-            f = os.path.join(basedir, expname, 'config.txt')
-            with open(f, 'w') as file:
-                file.write(open(args.config, 'r').read())
-
-        # Create nerf model
-        render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
-        global_step = start
-
-        bds_dict = {
-            'near': near,
-            'far': far,
-        }
-        render_kwargs_train.update(bds_dict)
-        render_kwargs_test.update(bds_dict)
-
-        # Move testing data to GPU
-        render_poses = torch.Tensor(render_poses).to(device)
-
-        # Short circuit if only rendering out from trained model
-        if args.render_only:
-            print('RENDER ONLY')
-            with torch.no_grad():
-                if args.render_test:
-                    # render_test switches to test poses
-                    images = images[i_test]
-                else:
-                    # Default is smoother render_poses path
-                    images = None
-
-                testsavedir = os.path.join(basedir, expname,
-                                           'renderonly_{}_{:06d}'.format('test' if args.render_test else 'path', start))
-                os.makedirs(testsavedir, exist_ok=True)
-                print('test poses shape', render_poses.shape)
-
-                rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images,
-                                      savedir=testsavedir, render_factor=args.render_factor)
-                print('Done rendering', testsavedir)
-                imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
-
-                return
-
-        # Prepare raybatch tensor if batching random rays
-        N_rand = args.N_rand
-        use_batching = not args.no_batching
-        if use_batching:
-            # For random ray batching
-            print('get rays')
-            rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:, :3, :4]], 0)  # [N, ro+rd, H, W, 3]
-            print('done, concats')
-            rays_rgb = np.concatenate([rays, images[:, None]], 1)  # [N, ro+rd+rgb, H, W, 3]
-            rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb, 3]
-            rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0)  # train images only
-            rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])  # [(N-1)*H*W, ro+rd+rgb, 3]
-            rays_rgb = rays_rgb.astype(np.float32)
-            print('shuffle rays')
-            np.random.shuffle(rays_rgb)
-
-            print('done')
-            i_batch = 0
-
-        # Move training data to GPU
-        if use_batching:
-            images = torch.Tensor(images).to(device)
-        poses = torch.Tensor(poses).to(device)
-        if use_batching:
-            rays_rgb = torch.Tensor(rays_rgb).to(device)
-
-        N_iters = 200000 + 1
-        print('Begin')
-        print('TRAIN views are', i_train)
-        print('TEST views are', i_test)
-        print('VAL views are', i_val)
-
-        # Summary writers
-        # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-
-        start = start + 1
-        for i in trange(start, N_iters):
-            time0 = time.time()
-
-            # Sample random ray batch
-            if use_batching:
-                # Random over all images
-                batch = rays_rgb[i_batch:i_batch + N_rand]  # [B, 2+1, 3*?]
-                batch = torch.transpose(batch, 0, 1)
-                batch_rays, target_s = batch[:2], batch[2]
-
-                i_batch += N_rand
-                if i_batch >= rays_rgb.shape[0]:
-                    print("Shuffle data after an epoch!")
-                    rand_idx = torch.randperm(rays_rgb.shape[0])
-                    rays_rgb = rays_rgb[rand_idx]
-                    i_batch = 0
-
-            else:
-                # Random from one image
-                img_i = np.random.choice(i_train)
-                target = images[img_i]
-                target = torch.Tensor(target).to(device)
-                pose = poses[img_i, :3, :4]
-
-                if N_rand is not None:
-                    rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
-
-                    if i < args.precrop_iters:
-                        dH = int(H // 2 * args.precrop_frac)
-                        dW = int(W // 2 * args.precrop_frac)
-                        coords = torch.stack(
-                            torch.meshgrid(
-                                torch.linspace(H // 2 - dH, H // 2 + dH - 1, 2 * dH),
-                                torch.linspace(W // 2 - dW, W // 2 + dW - 1, 2 * dW)
-                            ), -1)
-                        if i == start:
-                            print(
-                                f"[Config] Center cropping of size {2 * dH} x {2 * dW} is enabled until iter {args.precrop_iters}")
-                    else:
-                        coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
-                                             -1)  # (H, W, 2)
-
-                    coords = torch.reshape(coords, [-1, 2])  # (H * W, 2)
-                    select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-                    select_coords = coords[select_inds].long()  # (N_rand, 2)
-                    rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                    rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                    batch_rays = torch.stack([rays_o, rays_d], 0)
-                    target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-
-            #####  Core optimization loop  #####
-            rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                            verbose=i < 10, retraw=True,
-                                            **render_kwargs_train)
-
-            optimizer.zero_grad()
-            img_loss = img2mse(rgb, target_s)
-            trans = extras['raw'][..., -1]
-            loss = img_loss
-            psnr = mse2psnr(img_loss)
-
-            if 'rgb0' in extras:
-                img_loss0 = img2mse(extras['rgb0'], target_s)
-                loss = loss + img_loss0
-                psnr0 = mse2psnr(img_loss0)
-
-            loss.backward()
-            optimizer.step()
-
-            # NOTE: IMPORTANT!
-            ###   update learning rate   ###
-            decay_rate = 0.1
-            decay_steps = args.lrate_decay * 1000
-            new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = new_lrate
-            ################################
-
-            dt = time.time() - time0
-            # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
-            #####           end            #####
-
-            # Rest is logging
-            if i % args.i_weights == 0:
-                path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
-                torch.save({
-                    'global_step': global_step,
-                    'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
-                    'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }, path)
-                print('Saved checkpoints at', path)
-
-            if i % args.i_video == 0 and i > 0:
-                # Turn on testing mode
-                with torch.no_grad():
-                    rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
-                print('Done, saving', rgbs.shape, disps.shape)
-                moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-                imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
-                imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
-
-                # if args.use_viewdirs:
-                #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
-                #     with torch.no_grad():
-                #         rgbs_still, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test)
-                #     render_kwargs_test['c2w_staticcam'] = None
-                #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
-
-            if i % args.i_testset == 0 and i > 0:
-                testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
-                os.makedirs(testsavedir, exist_ok=True)
-                print('test poses shape', poses[i_test].shape)
-                with torch.no_grad():
-                    render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test,
-                                gt_imgs=images[i_test], savedir=testsavedir)
-                print('Saved test set')
-
-            if i % args.i_print == 0:
-                tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-            """
-                print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-                print('iter time {:.05f}'.format(dt))
-
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                    tf.contrib.summary.scalar('loss', loss)
-                    tf.contrib.summary.scalar('psnr', psnr)
-                    tf.contrib.summary.histogram('tran', trans)
-                    if args.N_importance > 0:
-                        tf.contrib.summary.scalar('psnr0', psnr0)
-
-
-                if i%args.i_img==0:
-
-                    # Log a rendered validation view to Tensorboard
-                    img_i=np.random.choice(i_val)
-                    target = images[img_i]
-                    pose = poses[img_i, :3,:4]
-                    with torch.no_grad():
-                        rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                            **render_kwargs_test)
-
-                    psnr = mse2psnr(img2mse(rgb, target))
-
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                        tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                        tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
-
-                        tf.contrib.summary.scalar('psnr_holdout', psnr)
-                        tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
-
-
-                    if args.N_importance > 0:
-
-                        with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                            tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                            tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                            tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-            """
-
-            global_step += 1
 class Writer(HookBase):
     def __init__(self,write_iter):
         self._debug_info = {}
@@ -529,7 +348,7 @@ class ComputeGradHook(HookBase):
         # datas[0]['image'].grad = None
 from shutil import copyfile
 
-class Trainer(DefaultTrainer): # for detectron
+class TrainerD(DefaultTrainer): # for detectron
     """
     We use the "DefaultTrainer" which contains pre-defined default logic for
     standard training workflow. They may not work for you, especially if you
@@ -612,8 +431,8 @@ class Detector:
         cfg.SOLVER.WARMUP_ITERS = 10
         cfg.SOLVER.STEPS = []  # do not decay learning rate
         cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 8  # faster, and good enough for this toy dataset (default: 512)
-        cfg.MODEL.ROI_HEADS.NUM_CLASSES = 6  # number of classes
-        cfg.MODEL.RETINANET.NUM_CLASSES = 6  # if use Retinanet change this
+        cfg.MODEL.ROI_HEADS.NUM_CLASSES = 3  # number of classes
+        cfg.MODEL.RETINANET.NUM_CLASSES = 3  # if use Retinanet change this
         # NOTE: this config means the number of classes, but a few popular unofficial tutorials incorrect uses num_classes+1 here.
         cfg.MODEL.BACKBONE.FREEZE_AT = 6 # freeze the whole Resnet backbone
         cfg.OUTPUT_DIR = os.path.join(args.basedir, args.expname, 'detectron_output')
@@ -666,7 +485,9 @@ class Detector:
                     'processing class_index: {}, class_name: {}, class_img_path: {}, from image_id: {}, annotation_id: {}'.format(
                         class_index, class_name, class_img_path, image_id, annotation_id))
                 file_list = [f for f in os.listdir(class_img_path) if os.path.splitext(f)[1] == ".png"]
-
+                bbox_path = os.path.join(output_dir, s, class_name, "bbox")
+                if not os.path.exists(bbox_path):
+                    os.makedirs(bbox_path)
                 for f in file_list:  # for each image
 
                     # image
@@ -678,7 +499,8 @@ class Detector:
                         os.makedirs(os.path.join(output_dir, s, class_name))
                     copyfile(file_path, target_file_path)
                     # load image and compute annotation
-                    bboxs, mask, height, width = self.get_annotation(file_path)
+                    bboxs, mask, height, width, visual_img = self.get_annotation(file_path)
+                    cv2.imwrite(os.path.join(bbox_path, f), visual_img)
                     new_img = {}
                     new_img["license"] = 0
                     new_img["file_name"] = os.path.join(s, class_name, f)  # relative path
@@ -793,9 +615,22 @@ class Detector:
         img = cv2.imread(img_path)  # for get mask and bbox
         gray_img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         height, width = gray_img.shape
-        (_, mask) = cv2.threshold(gray_img, 1, 255, cv2.THRESH_BINARY)  # get mask
+        (_, mask) = cv2.threshold(gray_img, 10, 255, cv2.THRESH_BINARY)  # get mask
+        ## find contours and fill them
+        contours, hierarchy = cv2.findContours(mask, mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_NONE)
+        area = []
+        for k in range(len(contours)):
+            area.append(cv2.contourArea(contours[k]))
+        max_idx = np.argmax(np.array(area))
+        mask_noise = mask.copy()
+        mask_noise = cv2.drawContours(mask_noise, contours, max_idx, (0,0,255), cv2.FILLED)
+        ## compute final mask
+        mask = mask - mask_noise
         bboxs = self.find_bbox(mask)[:, :-1]
-        return bboxs, mask, height, width
+        ## compute maximal bbox
+        x,y,w,h = cv2.boundingRect(contours[max_idx])
+        cv2.rectangle(img,(x, y),(x+w,y+h),(0,255,0),2)
+        return bboxs, mask, height, width, img
 
     def get_ycbv_dicts(self, ycbv_basedir):
 
@@ -810,7 +645,7 @@ class Detector:
                     record = {}
 
                     filename = os.path.join(ycbv_basedir, cate, img)
-                    bboxs, mask, height, width = self.get_annotation(filename)
+                    bboxs, mask, height, width, visual_img = self.get_annotation(filename)
                     if bboxs.shape[0] > 1:  # if have multiple objects, choose the largest one
                         bboxs = [bboxs[np.argmax(bboxs[:, -2] * bboxs[:, -1], axis=0)]]
                     record["file_name"] = filename
@@ -836,7 +671,7 @@ class Detector:
         '''train RetinaNet'''
         # if iteration == 0:
         # self.trainer = DefaultTrainer(self.cfg)
-        self.trainer = Trainer(self.cfg)
+        self.trainer = TrainerD(self.cfg)
         # self.trainer.register_hooks([HelloHook()])
         if iteration > 0: # start from second iteration
             self.cfg.MODEL.WEIGHTS = os.path.join(self.cfg.OUTPUT_DIR, 'model_final.pth')
@@ -1172,7 +1007,6 @@ def bilevel_optimization(my_nerf, my_detector, Optimiation_parameter):
         psi_optimizer = Adam(Optimiation_parameter.opt_lr, beta1=0.9, beta2=0.999)
     else: # use sgd
         psi_optimizer = SGD(Optimiation_parameter.opt_lr)
-
     for i in tqdm(range(epochs)):
         print('strating iteration {}'.format(i))
         ## 1 NeRF generate K = 50/100 images as D_train given /psi = categorical distribution of pose
@@ -1260,8 +1094,8 @@ def config_parser():
                         help='number of coarse samples per ray')
     parser.add_argument("--N_importance", type=int, default=0,
                         help='number of additional fine samples per ray')
-    parser.add_argument("--perturb", type=float, default=1.,
-                        help='set to 0. for no jitter, 1. for jitter')
+    # parser.add_argument("--perturb", type=float, default=1.,
+    #                     help='set to 0. for no jitter, 1. for jitter')
     parser.add_argument("--use_viewdirs", action='store_true',
                         help='use full 5D input instead of 3D')
     parser.add_argument("--i_embed", type=int, default=0,
@@ -1346,7 +1180,7 @@ def config_parser():
                         help='number of epochs to optimize')
     parser.add_argument("--object_id", type=str, default='2',
                         help='1~21')
-    parser.add_argument('--psi_pose_cats_mode', type=str,  default='5', help='1~8, uniform, two_13, two_27, three_123, three_147')
+    parser.add_argument('--psi_pose_cats_mode', type=str,  default='uniform', help='1~8, uniform, two_13, two_27, three_123, three_147')
     parser.add_argument('--train_val_path_info', type=str, default='../configs/ycb_synthetic_train_val_path_info.json',
                         help='json that save the images')
 
@@ -1358,6 +1192,21 @@ def config_parser():
     parser.add_argument('--test_distribution', type=str,  default='one_1', help='one_1~one_8, two_12, two_15, three_135')
     parser.add_argument('--opt_method', type=str,  default='momentum', help='sgd, momentum, Adam')
 
+
+    parser.add_argument('--bound', type=float, default=4, help="assume the scene is bounded in box[-bound, bound]^3, if > 1, will invoke adaptive ray marching.")
+    parser.add_argument('--min_near', type=float, default=0.2, help="minimum near distance for camera")
+    parser.add_argument('--cuda_ray', action='store_true', default = True, help="use CUDA raymarching instead of pytorch")
+    parser.add_argument('--density_thresh', type=float, default=10, help="threshold for density grid to be occupied")
+    parser.add_argument('--bg_radius', type=float, default=-1, help="if positive, use a background model at sphere(bg_radius)")
+
+    parser.add_argument('--fp16', action='store_true', help="use amp mixed precision training")
+    parser.add_argument('--ckpt', type=str, default='latest')
+    parser.add_argument('--workspace', type=str)
+
+    parser.add_argument('--patch_size', type=int, default=1, help="[experimental] render patches in training, so as to apply LPIPS loss. 1 means disabled, use [64, 32, 16] to enable")
+    parser.add_argument('--rand_pose', type=int, default=-1, help="<0 uses no rand pose, =0 only uses rand pose, >0 sample one rand pose every $ known poses")
+    parser.add_argument('-O', action='store_true', default=True, help="equals --fp16 --cuda_ray --preload")
+
     return parser
 
 
@@ -1365,8 +1214,37 @@ def main():
     # Load parameters of nerf
     parser = config_parser()
     args = parser.parse_args()
-    Nerf_parameter = args
-    my_nerf = NeRF(Nerf_parameter) # nerf initialization
+    
+    if args.O:
+        args.fp16 = True
+        args.cuda_ray = True
+        args.preload = True
+    
+    if args.patch_size > 1:
+        args.error_map = False # do not use error_map if use patch-based training
+        # assert args.patch_size > 16, "patch_size should > 16 to run LPIPS loss."
+        assert args.num_rays % (args.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
+
+    print(args.bound) # need to check the args.bound of init inst-nerf and pretrained one
+
+    my_nerf = NeRFNetwork( # use instant-nerf surrogate
+        encoding="hashgrid",
+        bound=args.bound, # default is 2, but default 1 in pretained inst-nerf
+        cuda_ray=args.cuda_ray,
+        density_scale=1,
+        min_near=args.min_near,
+        density_thresh=args.density_thresh, # 10 or 0.01 ?
+        bg_radius=args.bg_radius,
+    )
+    my_nerf.eval()
+
+    print(my_nerf)
+
+    criterion = torch.nn.MSELoss(reduction='none')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    metrics = [PSNRMeter(), LPIPSMeter(device=device)]
+    trainer = TrainerInstant('ngp', args, my_nerf, workspace=args.workspace, criterion=criterion, fp16=args.fp16, metrics=metrics, use_checkpoint=args.ckpt)
+
 
     # Load parameters of Detector (RetinaNet)
     Detector_parameter = args
@@ -1376,7 +1254,7 @@ def main():
     Optimiation_parameter = args
 
     # Optimization
-    results = bilevel_optimization(my_nerf, my_detector, Optimiation_parameter)
+    results = bilevel_optimization(trainer, my_detector, Optimiation_parameter)
 
 
 
