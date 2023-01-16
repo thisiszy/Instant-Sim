@@ -593,8 +593,8 @@ class Detector:
         cfg.SOLVER.WARMUP_ITERS = 10
         cfg.SOLVER.STEPS = []  # do not decay learning rate
         cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 8  # faster, and good enough for this toy dataset (default: 512)
-        cfg.MODEL.ROI_HEADS.NUM_CLASSES = 6  # number of classes
-        cfg.MODEL.RETINANET.NUM_CLASSES = 6  # if use Retinanet change this
+        cfg.MODEL.ROI_HEADS.NUM_CLASSES = 3  # number of classes
+        cfg.MODEL.RETINANET.NUM_CLASSES = 3  # if use Retinanet change this
         # NOTE: this config means the number of classes, but a few popular unofficial tutorials incorrect uses num_classes+1 here.
         cfg.MODEL.BACKBONE.FREEZE_AT = 6 # freeze the whole Resnet backbone
         cfg.OUTPUT_DIR = os.path.join(args.basedir, args.expname, 'detectron_output')
@@ -647,7 +647,9 @@ class Detector:
                     'processing class_index: {}, class_name: {}, class_img_path: {}, from image_id: {}, annotation_id: {}'.format(
                         class_index, class_name, class_img_path, image_id, annotation_id))
                 file_list = [f for f in os.listdir(class_img_path) if os.path.splitext(f)[1] == ".png"]
-
+                bbox_path = os.path.join(output_dir, s, class_name, "bbox")
+                if not os.path.exists(bbox_path):
+                    os.makedirs(bbox_path)
                 for f in file_list:  # for each image
 
                     # image
@@ -659,7 +661,8 @@ class Detector:
                         os.makedirs(os.path.join(output_dir, s, class_name))
                     copyfile(file_path, target_file_path)
                     # load image and compute annotation
-                    bboxs, mask, height, width, _ = self.get_annotation(file_path)
+                    bboxs, mask, height, width, visual_img = self.get_annotation(file_path)
+                    cv2.imwrite(os.path.join(bbox_path, f), visual_img)
                     new_img = {}
                     new_img["license"] = 0
                     new_img["file_name"] = os.path.join(s, class_name, f)  # relative path
@@ -774,9 +777,21 @@ class Detector:
         img = cv2.imread(img_path)  # for get mask and bbox
         gray_img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         height, width = gray_img.shape
-        (_, mask) = cv2.threshold(gray_img, 1, 255, cv2.THRESH_BINARY)  # get mask
+        (_, mask) = cv2.threshold(gray_img, 10, 255, cv2.THRESH_BINARY)  # get mask
+        ## find contours and fill them
+        contours, hierarchy = cv2.findContours(mask, mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_NONE)
+        area = []
+        for k in range(len(contours)):
+            area.append(cv2.contourArea(contours[k]))
+        max_idx = np.argmax(np.array(area))
+        mask_noise = mask.copy()
+        mask_noise = cv2.drawContours(mask_noise, contours, max_idx, (0,0,255), cv2.FILLED)
+        ## compute final mask
+        mask = mask - mask_noise
         bboxs = self.find_bbox(mask)[:, :-1]
-        cv2.rectangle(img,(bboxs[0][0], bboxs[0][1]),(bboxs[0][0]+bboxs[0][2],bboxs[0][1]+bboxs[0][3]),(0,255,0),2)
+        ## compute maximal bbox
+        x,y,w,h = cv2.boundingRect(contours[max_idx])
+        cv2.rectangle(img,(x, y),(x+w,y+h),(0,255,0),2)
         return bboxs, mask, height, width, img
 
     def get_ycbv_dicts(self, ycbv_basedir):
@@ -793,8 +808,6 @@ class Detector:
 
                     filename = os.path.join(ycbv_basedir, cate, img)
                     bboxs, mask, height, width, visual_img = self.get_annotation(filename)
-                    cv2.imwrite(os.path.join(ycbv_basedir, cate, "bbox", img), visual_img)
-                    print(os.path.join(ycbv_basedir, cate, "bbox", img))
                     if bboxs.shape[0] > 1:  # if have multiple objects, choose the largest one
                         bboxs = [bboxs[np.argmax(bboxs[:, -2] * bboxs[:, -1], axis=0)]]
                     record["file_name"] = filename
@@ -1177,7 +1190,6 @@ def bilevel_optimization(my_nerf, my_detector, Optimiation_parameter):
             inverse_hvp = my_detector.compute_inverse_hvp() # inverse_hvp = H^-1 * dL_val/dtheta fix backbone only update last layers (accurate)
             print('##########################################AFTER  inverse_hvp  ##################################################')
             # 3.2 Computer gradient of expectations (first part d (dL_train/dtheta) / d I)
-            breakpoint()
             grad_E = my_detector.compute_grad_E(inverse_hvp) # d (dL_train/dtheta) / d I * inverse_hvp (weight)
             print('##########################################AFTER  grad_E  ##################################################')
             # 3.3 Compute dI/d\psi in image patch wise, Run forward of NeRF again for backward.

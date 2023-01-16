@@ -135,10 +135,10 @@ def load_LINEMOD_data(basedir, half_res=False, testskip=1):
     K = meta['frames'][0]['intrinsic_matrix']
     print(f"Focal: {focal}")
     '''radius should be in the range of training set, blenderproc use 1~1.24, consistency'''
-    render_poses = torch.stack([pose_spherical(angle, -30.0, 1.01) for angle in np.linspace(-180, 180, 40 + 1)[:-1]], 0)
-    # render_poses = torch.stack([pose_spherical(angle, -50.0, 1.01) for angle in np.linspace(-180,180,40+1)[:-1]], 0)
-    # render_poses = torch.stack([pose_spherical(angle, -10.0, 1.01) for angle in np.linspace(-180, 180, 40 + 1)[:-1]], 0)
-    # render_poses = torch.stack([pose_spherical(angle, 10, 1.01) for angle in np.linspace(-180, 180, 40 + 1)[:-1]], 0)
+    render_poses = torch.stack([pose_spherical(angle, -30.0, 0.4) for angle in np.linspace(-180, 180, 40 + 1)[:-1]], 0)
+    # render_poses = torch.stack([pose_spherical(angle, -50.0, 0.4) for angle in np.linspace(-180,180,40+1)[:-1]], 0)
+    # render_poses = torch.stack([pose_spherical(angle, -10.0, 0.4) for angle in np.linspace(-180, 180, 40 + 1)[:-1]], 0)
+    # render_poses = torch.stack([pose_spherical(angle, 10, 0.4) for angle in np.linspace(-180, 180, 40 + 1)[:-1]], 0)
 
     if half_res:
         scale_factor = 2
@@ -196,7 +196,23 @@ def load_data_param(basedir, half_res=False, testskip=1):
     # far = np.ceil(max(metas['train']['far'], metas['test']['far']))
     near = metas['train']['near'] - 0.5  # enlarge the gap between near and far
     far = metas['train']['far'] + 0.5
-    return [H, W, focal], K, near, far
+    
+    # load intrinsics
+    if 'fl_x' in metas['train'] or 'fl_y' in metas['train']:
+        fl_x = (metas['train']['fl_x'] if 'fl_x' in metas['train'] else metas['train']['fl_y'])
+        fl_y = (metas['train']['fl_y'] if 'fl_y' in metas['train'] else metas['train']['fl_x'])
+    elif 'camera_angle_x' in metas['train'] or 'camera_angle_y' in metas['train']:
+        # blender, assert in radians. already downscaled since we use H/W
+        fl_x = W / (2 * np.tan(metas['train']['camera_angle_x'] / 2)) if 'camera_angle_x' in metas['train'] else None
+        fl_y = H / (2 * np.tan(metas['train']['camera_angle_y'] / 2)) if 'camera_angle_y' in metas['train'] else None
+        if fl_x is None: fl_x = fl_y
+        if fl_y is None: fl_y = fl_x
+    else:
+        raise RuntimeError('Failed to load focal length, please check the transforms.json!')
+
+    cx = (metas['train']['cx']) if 'cx' in metas['train'] else (W / 2)
+    cy = (metas['train']['cy']) if 'cy' in metas['train'] else (H / 2)
+    return [H, W, focal], K, near, far, np.array([fl_x, fl_y, cx, cy])
 
 
 def sample_pose(categorical_prob, num_K, gumble_T, sample_log):
@@ -241,7 +257,7 @@ def sample_pose(categorical_prob, num_K, gumble_T, sample_log):
     render_poses = []
     for i, phi in enumerate(differentiable_samples_1_uniform):
         theta = torch.Tensor([thetas[i]])
-        render_poses.append(pose_spherical(theta, phi - 180, 1.01))
+        render_poses.append(pose_spherical(theta, phi - 180, 0.4))
 
     render_poses = torch.stack(render_poses, 0)  # (0~360) to (-180, 180)
     return render_poses
@@ -290,7 +306,7 @@ def sample_pose_nograd(categorical_prob, num_K, gumble_T):
     for phi in differentiable_samples_1_uniform:
         # theta = np.random.uniform(-180, 180)
         theta = np.random.uniform(85, 95)  # limit range to accelerate the optimization
-        render_poses.append(pose_spherical_nograd(theta, phi - 180, 1.01))
+        render_poses.append(pose_spherical_nograd(theta, phi - 180, 0.4))
         thetas.append(theta)
 
     render_poses = torch.stack(render_poses, 0)  # (0~360) to (-180, 180)
@@ -322,7 +338,7 @@ def sample_pose_nograd_gaussian(pose_mean_nograd, pose_var_nograd, num_K):
             phi = phi % 360 + 360
         # theta = np.random.uniform(-180, 180) # totally free
         theta = np.random.uniform(85, 95) # limit range to accelerate the optimization
-        render_poses.append(pose_spherical_nograd(theta, phi - 180, 1.01)) # (theta, phi - 180, zoom)
+        render_poses.append(pose_spherical_nograd(theta, phi - 180, 0.4)) # (theta, phi - 180, zoom)
 
     render_poses = torch.stack(render_poses, 0)  # (0~360) to (-180, 180)
     return render_poses, phis
