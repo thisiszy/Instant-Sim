@@ -14,7 +14,21 @@ This is the source code for this course project. Generally speaking, we integrat
 
 Note: This project is intended for gaining fundamental knowledge and practical implementaion of NeRFs. Due to the customized implementation of (Instant-) NeRFs, merging two repo is not trivial and a thorough understanding of source code is required. Hence, we want to clarify here that, some modifications are hardcoded and we do not guarantee all terminal flag options work properly as they used to be. But feel free to post any regarding issues! We also post out the code illustration here to help you understanding the pipeline.      
 
-<br /><br />
+## Installation
+### 1. Clone the repo
+```bash
+git clone --recursive https://github.com/thisiszy/Neural-Sim-NeRF.git
+```
+
+### 2. Virtual environment
+Tested on Python/3.10.4 with gcc/8.2.0, cuda/11.7.0, nccl/2.11.4-1, cudnn/8.2.1.32
+
+```bash
+cd Neural-Sim-NeRF
+python -m venv venv
+source venv/bin/activate
+./install.sh
+```
 
 ## Quick start
 ### 1. Generate training data
@@ -75,26 +89,3 @@ Our solution to above issue is using no-cuda rendering computation for with-grad
 - Instant NeRF is pretrained and loaded into Neural-Sim's pipeline with saved checkpoint file. Since we need to first initialize the Instant NeRF network and call <code> load_ckeckpoint()</code> on <code> .pth</code> files to reload Instant-NeRF model in Neural-Sim. Model reload could be impaired by wrong configuration for Instant NeRF network initialization, becuase parameters of encoding layer might depend on these arguments. So,we need to guarantee the NeRF training arguments consistent with those for Neural-sim configurations (e.g bound and scale).
 
 - Another possible configuration conflict could happen in camera pose sampling step. We need to modify <code>load_LINMOD_noscale.py</code> for loading camera intrinscs from training/testing data <code>.json</code> files to <code>render_image()</code>. Besides, camera poses (camera_to_world [4 * 4] matrix) sampled from <code>sample_poses()</code> are not compatible with our settings. The default radius should be changed to the BlenderNeRF generator parameters (this cannot be done with parser, so we hardcode this). The rotation part of the sampled poses is also not compatible to our dataset, becaese we observed that the inital camera pose of Neural-Sim is different from our generation setting. By tedious experiments, we rectified this error by reverse the directions of all rays.
-
-
-
-<br /><br />
-## Reproducing experiments
-
-
-
-## Installation
-### 1. Clone the repo
-```bash
-git clone --recursive https://github.com/thisiszy/Neural-Sim-NeRF.git
-```
-
-### 2. Virtual environment
-Tested on Python/3.10.4 with gcc/8.2.0, cuda/11.7.0, nccl/2.11.4-1, cudnn/8.2.1.32
-
-```bash
-cd Neural-Sim-NeRF
-python -m venv venv
-source venv/bin/activate
-./install.sh
-```
