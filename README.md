@@ -59,6 +59,7 @@ python neural_sim_main.py --config ../configs/nerf_param_ycbv_general.txt --obje
 python neural_sim_main.py --config ../configs/nerf_param_ycbv_general.txt --object_id 2 --expname  exp_ycb_synthetic --ckpt PATH_TO_YOUR_MODEL(e.g hand_fist)
 python neural_sim_main.py --config ../configs/nerf_param_ycbv_general.txt --object_id 8 --expname  exp_ycb_synthetic --ckpt PATH_TO_YOUR_MODEL(e.g hand_yeah)
 ```
+For more options, please refer to [original neural-sim repo](https://github.com/gyhandy/Neural-Sim-NeRF).
 
 ## Implementation Detials 
 <div align="center">
