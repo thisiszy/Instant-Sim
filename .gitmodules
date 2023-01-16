@@ -1,0 +1,3 @@
+[submodule "instant-nerf"]
+	path = instant-nerf
+	url = https://github.com/thisiszy/torch-ngp.git
