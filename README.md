@@ -7,7 +7,7 @@ This repo is still in actively updating!
 This is the source code for this course project. Generally speaking, we integrate [Instant-NeRF](https://github.com/NVlabs/instant-ngp) (followed this pytorch [implementaion](https://github.com/ashawkey/torch-ngp)) in the original version of [Neural-Sim](https://github.com/gyhandy/Neural-Sim-NeRF) to facilitate NeRF model training and evaluation step for downstream task. We ran the experiments on a self-generated dataset: hand gesture detection based on BlenderNeRF, to verify the successful integration. 
 
 <div align="center">
-    <img src="./overview1.png" width="800">
+    <img src="./overview.png" width="800">
 </div>
 
 <br/>
